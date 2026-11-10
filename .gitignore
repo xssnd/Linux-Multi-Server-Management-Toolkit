@@ -1,0 +1,4 @@
+config.sh
+servers.tsv
+logs/*
+!logs/.gitkeep

@@ -1,0 +1,5 @@
+# host<TAB>user<TAB>port<TAB>identity_file
+# Replace these examples with your real servers.
+192.0.2.10	admin	22	-
+192.0.2.11	admin	22	-
+192.0.2.12	ubuntu	2222	/home/admin/.ssh/prod_ed25519
