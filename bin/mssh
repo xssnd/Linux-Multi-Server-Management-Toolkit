@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# Multi-server SSH manager. Requires Bash 4.3+, OpenSSH client.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+CONFIG_FILE="${MSSH_CONFIG:-$ROOT_DIR/config.sh}"
+INVENTORY="${MSSH_INVENTORY:-$ROOT_DIR/servers.tsv}"
+
+# Defaults; config.sh may override these.
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+KNOWN_HOSTS="${KNOWN_HOSTS:-$HOME/.ssh/known_hosts}"
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-10}"
+SERVER_ALIVE_INTERVAL="${SERVER_ALIVE_INTERVAL:-30}"
+SERVER_ALIVE_COUNT_MAX="${SERVER_ALIVE_COUNT_MAX:-3}"
+MAX_PARALLEL="${MAX_PARALLEL:-10}"
+LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs}"
+STRICT_HOST_KEY_CHECKING="${STRICT_HOST_KEY_CHECKING:-yes}"
+SSH_EXTRA_OPTS="${SSH_EXTRA_OPTS:-}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  mssh list
+  mssh check [--limit N]
+  mssh exec [--limit N] -- 'REMOTE_COMMAND'
+  mssh monitor [--limit N]
+  mssh copy-to [--limit N] LOCAL_FILE REMOTE_PATH
+  mssh copy-from [--limit N] REMOTE_PATH LOCAL_DIRECTORY
+
+Inventory: servers.tsv (tab-separated)
+  host<TAB>user<TAB>port<TAB>identity_file
+Blank lines and lines beginning with # are ignored.
+Use '-' for identity_file to use SSH_KEY from config.
+
+Examples:
+  ./bin/mssh list
+  ./bin/mssh check
+  ./bin/mssh exec -- 'hostname; uptime; df -h'
+  ./bin/mssh monitor
+  ./bin/mssh copy-to ./patch.tgz /tmp/patch.tgz
+  ./bin/mssh copy-from /var/log/syslog ./collected-logs
+
+Host keys must already be trusted in KNOWN_HOSTS. Do not disable host-key checking.
+EOF
+}
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+# Config is an administrator-controlled shell file. Do not use untrusted config files.
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
+[[ "$MAX_PARALLEL" =~ ^[1-9][0-9]*$ ]] || die "MAX_PARALLEL must be a positive integer"
+[[ "$CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "CONNECT_TIMEOUT must be a positive integer"
+need_cmd ssh
+need_cmd scp
+need_cmd awk
+need_cmd date
+mkdir -p -- "$LOG_DIR"
+chmod 700 "$LOG_DIR" 2>/dev/null || true
+
+declare -a HOSTS=() USERS=() PORTS=() KEYS=()
+load_inventory() {
+  [[ -r "$INVENTORY" ]] || die "Cannot read inventory: $INVENTORY"
+  local host user port key extra line_no=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_no+=1))
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    IFS=$'\t' read -r host user port key extra <<< "$line"
+    [[ -n "${host:-}" && -n "${user:-}" && -n "${port:-}" ]] ||
+      die "Invalid inventory line $line_no: expected host, user, port, identity_file"
+    [[ -z "${extra:-}" ]] || die "Invalid inventory line $line_no: too many columns"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) ||
+      die "Invalid SSH port on inventory line $line_no"
+    [[ "$host" != -* && "$host" != *[[:space:]]* ]] ||
+      die "Invalid host on inventory line $line_no"
+    [[ "$user" != -* && "$user" != *[[:space:]]* ]] ||
+      die "Invalid username on inventory line $line_no"
+    [[ -n "${key:-}" && "$key" != "-" ]] || key="$SSH_KEY"
+    HOSTS+=("$host"); USERS+=("$user"); PORTS+=("$port"); KEYS+=("$key")
+  done < "$INVENTORY"
+  ((${#HOSTS[@]} > 0)) || die "No servers found in $INVENTORY"
+}
+
+ssh_base() {
+  local idx="$1"
+  SSH_ARGS=(
+    -i "${KEYS[$idx]}" -p "${PORTS[$idx]}"
+    -o BatchMode=yes
+    -o IdentitiesOnly=yes
+    -o ConnectTimeout="$CONNECT_TIMEOUT"
+    -o StrictHostKeyChecking="$STRICT_HOST_KEY_CHECKING"
+    -o UserKnownHostsFile="$KNOWN_HOSTS"
+    -o ServerAliveInterval="$SERVER_ALIVE_INTERVAL"
+    -o ServerAliveCountMax="$SERVER_ALIVE_COUNT_MAX"
+    -o LogLevel=ERROR
+  )
+  # Optional extra options are whitespace-split intentionally; do not put secrets here.
+  if [[ -n "$SSH_EXTRA_OPTS" ]]; then
+    local -a extra_opts
+    read -r -a extra_opts <<< "$SSH_EXTRA_OPTS"
+    SSH_ARGS+=("${extra_opts[@]}")
+  fi
+}
+
+safe_name() {
+  local value="$1"
+  value="${value//[^a-zA-Z0-9_.-]/_}"
+  printf '%s' "$value"
+}
+
+declare -a PIDS=()
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+run_job() {
+  local idx="$1" action="$2"
+  local host="${HOSTS[$idx]}" user="${USERS[$idx]}"
+  local logfile="$LOG_DIR/${RUN_ID}-$(printf '%03d' "$((idx+1))")-$(safe_name "$host").log"
+  local statusfile="$LOG_DIR/${RUN_ID}-$(printf '%03d' "$((idx+1))").status"
+  (
+    ssh_base "$idx"
+    local target="${user}@${host}" rc=0
+    {
+      printf '=== %s | %s | %s ===\n' "$host" "$action" "$(date -Is)"
+      case "$action" in
+        check)
+          ssh "${SSH_ARGS[@]}" "$target" 'printf "HOST: "; hostname; printf "UPTIME: "; uptime'
+          rc=$?
+          ;;
+        monitor)
+          ssh "${SSH_ARGS[@]}" "$target" \
+            'printf "HOST: "; hostname; printf "\nOS:\n"; (cat /etc/os-release 2>/dev/null | head -n 3); printf "\nUPTIME:\n"; uptime; printf "\nCPU/LOAD:\n"; getconf _NPROCESSORS_ONLN 2>/dev/null; printf "\nMEMORY:\n"; free -h 2>/dev/null || awk "/MemTotal|MemAvailable/ {print}" /proc/meminfo; printf "\nDISK:\n"; df -h -x tmpfs -x devtmpfs'
+          rc=$?
+          ;;
+        exec)
+          ssh "${SSH_ARGS[@]}" "$target" "$REMOTE_COMMAND"
+          rc=$?
+          ;;
+        copy-to)
+          scp -p -P "${PORTS[$idx]}" -i "${KEYS[$idx]}" \
+            -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o ConnectTimeout="$CONNECT_TIMEOUT" \
+            -o StrictHostKeyChecking="$STRICT_HOST_KEY_CHECKING" \
+            -o UserKnownHostsFile="$KNOWN_HOSTS" \
+            -- "$COPY_LOCAL" "$target:$COPY_REMOTE"
+          rc=$?
+          ;;
+        copy-from)
+          scp -p -P "${PORTS[$idx]}" -i "${KEYS[$idx]}" \
+            -o BatchMode=yes -o IdentitiesOnly=yes \
+            -o ConnectTimeout="$CONNECT_TIMEOUT" \
+            -o StrictHostKeyChecking="$STRICT_HOST_KEY_CHECKING" \
+            -o UserKnownHostsFile="$KNOWN_HOSTS" \
+            -- "$target:$COPY_REMOTE" "$COPY_LOCAL"
+          rc=$?
+          ;;
+      esac
+      printf '\nEXIT_CODE: %s\n' "$rc"
+    } >"$logfile" 2>&1
+    printf '%s\n' "$rc" > "$statusfile"
+    exit "$rc"
+  ) &
+  PIDS+=("$!")
+  printf 'Started %-30s (PID %s)\n' "$host" "$!"
+}
+
+run_all() {
+  local action="$1" idx=0 running=0
+  PIDS=()
+  for ((idx=0; idx<${#HOSTS[@]}; idx++)); do
+    run_job "$idx" "$action"
+    ((running+=1))
+    if (( running >= MAX_PARALLEL )); then
+      wait -n || true
+      ((running-=1))
+    fi
+  done
+  while (( running > 0 )); do
+    wait -n || true
+    ((running-=1))
+  done
+
+  printf '\n%-30s %s\n' "SERVER" "RESULT"
+  printf '%-30s %s\n' "------------------------------" "----------"
+  local ok=0 fail=0 host statusfile rc
+  for ((idx=0; idx<${#HOSTS[@]}; idx++)); do
+    host="${HOSTS[$idx]}"
+    statusfile="$LOG_DIR/${RUN_ID}-$(printf '%03d' "$((idx+1))").status"
+    if [[ -f "$statusfile" ]]; then
+      rc="$(<"$statusfile")"
+    else
+      rc=255
+    fi
+    if [[ "$rc" == 0 ]]; then
+      printf '%-30s %s\n' "$host" "SUCCESS"
+      ((ok+=1))
+    else
+      printf '%-30s %s (exit %s)\n' "$host" "FAILED" "$rc"
+      ((fail+=1))
+    fi
+  done
+  printf '\nCompleted: %d successful, %d failed. Logs: %s\n' "$ok" "$fail" "$LOG_DIR"
+  (( fail == 0 ))
+}
+
+parse_limit() {
+  if [[ "${1:-}" == "--limit" ]]; then
+    [[ "${2:-}" =~ ^[1-9][0-9]*$ ]] || die "--limit requires a positive integer"
+    MAX_PARALLEL="$2"
+    shift 2
+  fi
+  REMAINING_ARGS=("$@")
+}
+
+[[ $# -ge 1 ]] || { usage; exit 2; }
+COMMAND="$1"; shift
+parse_limit "$@"
+set -- "${REMAINING_ARGS[@]}"
+
+case "$COMMAND" in
+  list)
+    load_inventory
+    printf '%-30s %-18s %-8s %s\n' "HOST" "USER" "PORT" "IDENTITY"
+    for ((i=0; i<${#HOSTS[@]}; i++)); do
+      printf '%-30s %-18s %-8s %s\n' "${HOSTS[$i]}" "${USERS[$i]}" "${PORTS[$i]}" "${KEYS[$i]}"
+    done
+    ;;
+  check|monitor)
+    load_inventory
+    run_all "$COMMAND"
+    ;;
+  exec)
+    load_inventory
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -gt 0 ]] || die "exec requires a remote command; see usage"
+    REMOTE_COMMAND="$*"
+    run_all exec
+    ;;
+  copy-to)
+    load_inventory
+    [[ $# -eq 2 ]] || die "copy-to requires LOCAL_FILE REMOTE_PATH"
+    [[ -f "$1" ]] || die "Local file not found: $1"
+    COPY_LOCAL="$1"; COPY_REMOTE="$2"
+    run_all copy-to
+    ;;
+  copy-from)
+    load_inventory
+    [[ $# -eq 2 ]] || die "copy-from requires REMOTE_PATH LOCAL_DIRECTORY"
+    mkdir -p -- "$2"
+    COPY_REMOTE="$1"; COPY_LOCAL="$2"
+    # Avoid collisions by requiring a per-host destination directory.
+    for ((i=0; i<${#HOSTS[@]}; i++)); do
+      mkdir -p -- "$COPY_LOCAL/$(safe_name "${HOSTS[$i]}")"
+    done
+    # Override destination per host in a wrapper variable consumed by worker.
+    ORIGINAL_LOCAL="$COPY_LOCAL"
+    COPY_LOCAL="$ORIGINAL_LOCAL"
+    # copy-from writes each server's file into a host-specific directory.
+    run_copy_from() {
+      local idx="$1"
+      local host="${HOSTS[$idx]}" user="${USERS[$idx]}"
+      local logfile="$LOG_DIR/${RUN_ID}-$(printf '%03d' "$((idx+1))")-$(safe_name "$host").log"
+      local statusfile="$LOG_DIR/${RUN_ID}-$(printf '%03d' "$((idx+1))").status"
+      (
+        ssh_base "$idx"
+        scp -p -P "${PORTS[$idx]}" -i "${KEYS[$idx]}" \
+          -o BatchMode=yes -o IdentitiesOnly=yes \
+          -o ConnectTimeout="$CONNECT_TIMEOUT" \
+          -o StrictHostKeyChecking="$STRICT_HOST_KEY_CHECKING" \
+          -o UserKnownHostsFile="$KNOWN_HOSTS" \
+          -- "${user}@${host}:$COPY_REMOTE" "$ORIGINAL_LOCAL/$(safe_name "$host")/" \
+          >"$logfile" 2>&1
+        rc=$?
+        printf 'EXIT_CODE: %s\n' "$rc" >>"$logfile"
+        printf '%s\n' "$rc" >"$statusfile"
+        exit "$rc"
+      ) &
+      PIDS+=("$!")
+      printf 'Started %-30s (PID %s)\n' "$host" "$!"
+    }
+    PIDS=(); running=0
+    for ((i=0; i<${#HOSTS[@]}; i++)); do
+      run_copy_from "$i"; ((running+=1))
+      if (( running >= MAX_PARALLEL )); then wait -n || true; ((running-=1)); fi
+    done
+    while ((running > 0)); do wait -n || true; ((running-=1)); done
+    printf 'Copy-from complete. Destination: %s/<host>/\n' "$ORIGINAL_LOCAL"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
