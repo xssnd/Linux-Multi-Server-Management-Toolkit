@@ -71,6 +71,36 @@ collected/
 
 Logs are written to `logs/` with a unique run identifier. Protect logs because command output may contain sensitive operational information.
 
+## Interactive tmux dashboard
+
+Launch the fleet dashboard from the repository root:
+
+```bash
+chmod 700 bin/system_dashboard.sh
+./bin/system_dashboard.sh
+```
+
+The dashboard uses the same `config.sh` and four-column `servers.tsv` inventory as `bin/mssh`. It creates a tmux session with a global fleet overview, one detail window per inventory host (named from its hostname/IP), and a hidden collector window. Offline hosts remain listed and are marked `OFFLINE`.
+
+Useful options:
+
+```bash
+./bin/system_dashboard.sh --refresh 10
+./bin/system_dashboard.sh --session production-fleet
+```
+
+Navigation (tmux default prefix is `Ctrl-b`):
+
+- `Ctrl-b 0`: global fleet overview
+- `Ctrl-b 1` ... `Ctrl-b 9`: select a server window
+- `Ctrl-b w`: interactive window picker
+- `Ctrl-b n` / `Ctrl-b p`: next / previous window
+- `Ctrl-b d`: detach; the dashboard session continues
+
+The collector polls servers concurrently, bounded by `MAX_PARALLEL`, and writes its short-lived cache under `logs/dashboard-cache/`. The refresh interval defaults to 5 seconds and can be overridden with `DASHBOARD_REFRESH_INTERVAL` or `--refresh`. The dashboard requires tmux on the management host, SSH key authentication, and pre-verified host keys in `KNOWN_HOSTS`; it deliberately refuses to disable strict host-key checking. Close the tmux session to stop its collector.
+
+The overview currently reports SSH reachability, CPU busy estimate, RAM, swap, maximum filesystem utilization, load average, and failed systemd unit count. Values depend on tools and permissions available on each target. CPU busy is a since-boot estimate, not a per-refresh utilization delta.
+
 ## Security notes
 
 - Use a dedicated least-privilege account and grant only the required `sudo` permissions.
