@@ -92,7 +92,7 @@ Useful options:
 Navigation (tmux default prefix is `Ctrl-b`):
 
 - `Ctrl-b 0`: global fleet overview
-- `Ctrl-b 1` ... `Ctrl-b 9`: select a server window
+- `Ctrl-b w`: open the window picker and select a server by its hostname/IP
 - `Ctrl-b w`: interactive window picker
 - `Ctrl-b n` / `Ctrl-b p`: next / previous window
 - `Ctrl-b d`: detach; the dashboard session continues
