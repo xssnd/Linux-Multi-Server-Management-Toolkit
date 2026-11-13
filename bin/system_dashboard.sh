@@ -88,7 +88,6 @@ done < "$INVENTORY"
 mkdir -p -- "$CACHE_DIR" "$LOG_DIR"
 chmod 700 "$CACHE_DIR" "$LOG_DIR" 2>/dev/null || true
 LOCK_DIR="$CACHE_DIR/collector.lock"
-PID_FILE="$CACHE_DIR/collector.pid"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
 
 ssh_base() {
@@ -227,6 +226,7 @@ render_server() {
   done
 }
 
+if [[ "${1:-}" == "__collector" ]]; then collector_loop; exit 0; fi
 if [[ "${1:-}" == "__global" ]]; then render_global; exit 0; fi
 if [[ "${1:-}" == "__server" ]]; then render_server "$2"; exit 0; fi
 
@@ -236,15 +236,11 @@ if [[ -n "${TMUX:-}" ]]; then
 fi
 
 if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-  # Start collector detached; the tmux session owns its lifecycle.
-  if [[ -f "$PID_FILE" ]] && kill -0 "$(<"$PID_FILE")" 2>/dev/null; then
-    :
-  else
-    collector_loop &
-    echo "$!" > "$PID_FILE"
-  fi
+  # Run the collector in a hidden tmux window so it stops with the session.
   tmux new-session -d -s "$SESSION_NAME" -n GLOBAL-HEALTH \
     "bash $(printf '%q' "$SCRIPT_PATH") __global"
+  tmux new-window -d -t "$SESSION_NAME" -n COLLECTOR \
+    "bash $(printf '%q' "$SCRIPT_PATH") __collector"
   for ((i=0; i<${#HOSTS[@]}; i++)); do
     tmux new-window -t "$SESSION_NAME" -n "${LABELS[$i]}" \
       "bash $(printf '%q' "$SCRIPT_PATH") __server $i"
