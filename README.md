@@ -80,26 +80,32 @@ chmod 700 bin/system_dashboard.sh
 ./bin/system_dashboard.sh
 ```
 
-The dashboard uses the same `config.sh` and four-column `servers.tsv` inventory as `bin/mssh`. It creates a tmux session with a global fleet overview, one detail window per inventory host (named from its hostname/IP), and a hidden collector window. Offline hosts remain listed and are marked `OFFLINE`.
+The dashboard reuses `config.sh` and the same four-column `servers.tsv` inventory as `bin/mssh`. It creates a tmux session containing:
 
-Useful options:
+- **GLOBAL-HEALTH** — a fleet-wide table showing connection state, CPU estimate, RAM, swap, maximum filesystem utilization, load average, and failed systemd unit count.
+- **One window per inventory host** — detail view with hostname, OS, kernel, uptime, load, CPU, memory, filesystems, top CPU processes, failed systemd units, and network interfaces.
+- **COLLECTOR** — a background tmux window that gathers data once per host per refresh cycle. It is created detached and normally stays out of the way.
+
+Offline hosts remain in the dashboard and are marked `OFFLINE`; their windows are not removed. Window names are sanitized versions of the inventory host/IP. Data is collected concurrently, with concurrency bounded by `MAX_PARALLEL`. Cache files are stored in `logs/dashboard-cache/` and written atomically so a display does not read a half-written result.
+
+Options:
 
 ```bash
 ./bin/system_dashboard.sh --refresh 10
 ./bin/system_dashboard.sh --session production-fleet
 ```
 
+The default refresh interval is 5 seconds. Override it with `DASHBOARD_REFRESH_INTERVAL` or `--refresh`. Override paths using the existing `MSSH_CONFIG` and `MSSH_INVENTORY` environment variables. The dashboard requires tmux, OpenSSH, and the local `timeout` utility. Remote detail sections use common Linux utilities such as `ps`, `df`, `ip`, and `systemctl`; sections may be empty or unavailable on minimal distributions or systems without systemd/iproute2.
+
 Navigation (tmux default prefix is `Ctrl-b`):
 
 - `Ctrl-b 0`: global fleet overview
-- `Ctrl-b w`: open the window picker and select a server by its hostname/IP
-- `Ctrl-b w`: interactive window picker
+- `Ctrl-b w`: choose a host window by its hostname/IP
 - `Ctrl-b n` / `Ctrl-b p`: next / previous window
-- `Ctrl-b d`: detach; the dashboard session continues
+- `Ctrl-b d`: detach; the dashboard session and collector continue
+- `tmux kill-session -t linux-fleet`: stop the dashboard and its collector (replace the session name if overridden)
 
-The collector polls servers concurrently, bounded by `MAX_PARALLEL`, and writes its short-lived cache under `logs/dashboard-cache/`. The refresh interval defaults to 5 seconds and can be overridden with `DASHBOARD_REFRESH_INTERVAL` or `--refresh`. The dashboard requires tmux on the management host, SSH key authentication, and pre-verified host keys in `KNOWN_HOSTS`; it deliberately refuses to disable strict host-key checking. Close the tmux session to stop its collector.
-
-The overview currently reports SSH reachability, CPU busy estimate, RAM, swap, maximum filesystem utilization, load average, and failed systemd unit count. Values depend on tools and permissions available on each target. CPU busy is a since-boot estimate, not a per-refresh utilization delta.
+**Security and metric notes:** SSH uses key authentication, `BatchMode=yes`, and `StrictHostKeyChecking=yes`; the script refuses to run if strict checking is disabled. Verify server fingerprints out of band and keep `KNOWN_HOSTS` current. CPU busy is a since-boot estimate from `/proc/stat`, not a delta-based per-refresh utilization reading. The dashboard is a read-only observer; it does not restart services or modify remote hosts. Protect the cache and logs because operational details may be sensitive.
 
 ## Security notes
 
