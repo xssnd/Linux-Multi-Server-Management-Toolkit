@@ -118,6 +118,10 @@ awk "/MemTotal:/ {t=\$2} /MemAvailable:/ {a=\$2} END {if(t>0) printf \"ram_used=
 awk "/SwapTotal:/ {t=\$2} /SwapFree:/ {f=\$2} END {if(t>0) printf \"swap_used=%.0f\\n\",100*(t-f)/t; else print \"swap_used=0\"}" /proc/meminfo 2>/dev/null
 df -P -x tmpfs -x devtmpfs 2>/dev/null | awk "NR>1 {gsub(/%/, \"\", \$5); if(\$5>m) m=\$5} END {printf \"disk_max=%d\\n\",m}"
 printf "failed_units=%s\n" "$(systemctl --failed --no-legend 2>/dev/null | wc -l | tr -d " ")"
+printf "kernel=%s\n" "$(uname -r 2>/dev/null)"
+printf "top_cpu=%s\n" "$(ps -eo comm,%cpu --sort=-%cpu 2>/dev/null | head -n 6 | tail -n 5 | tr \"\\n\" \";\")"
+printf "network=%s\n" "$(ip -brief address 2>/dev/null | tr \"\\n\" \";\")"
+printf "filesystems=%s\n" "$(df -h -x tmpfs -x devtmpfs 2>/dev/null | tail -n +2 | head -n 8 | tr \"\\n\" \";\")"
 '
 
 collect_one() {
@@ -130,10 +134,11 @@ collect_one() {
     {
       printf 'status=ONLINE\nupdated=%s\n' "$stamp"
       cat "$tmp"
-    } >"$out"
+    } >"$out.new"
   else
-    printf 'status=OFFLINE\nupdated=%s\nerror=SSH probe failed\n' "$stamp" >"$out"
+    printf 'status=OFFLINE\nupdated=%s\nerror=SSH probe failed\n' "$stamp" >"$out.new"
   fi
+  mv -f -- "$out.new" "$out"
   rm -f -- "$tmp"
 }
 
@@ -217,6 +222,10 @@ render_server() {
           swap_used) printf 'Swap used        : %s%%\n' "$value" ;;
           disk_max) printf 'Max filesystem   : %s%%\n' "$value" ;;
           failed_units) printf 'Failed services  : %s\n' "$value" ;;
+          kernel) printf 'Kernel           : %s\n' "$value" ;;
+          top_cpu) printf 'Top CPU processes: %s\n' "$value" ;;
+          network) printf 'Network          : %s\n' "$value" ;;
+          filesystems) printf 'Filesystems      : %s\n' "$value" ;;
           error) printf 'Error            : %s\n' "$value" ;;
         esac
       done < "$file"
