@@ -68,6 +68,7 @@ need_cmd tmux
 need_cmd ssh
 need_cmd awk
 need_cmd date
+need_cmd timeout
 [[ -r "$INVENTORY" ]] || die "Cannot read inventory: $INVENTORY"
 
 declare -a HOSTS=() USERS=() PORTS=() KEYS=() LABELS=()
